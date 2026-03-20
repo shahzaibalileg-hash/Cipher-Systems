@@ -2,26 +2,29 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import { Download, Search, Clock, Lock } from "lucide-react";
 import FileDropZone from "@/components/FileDropZone";
-import { encryptFile, decryptFile, generateShareCode } from "@/lib/file-crypto";
+import { decryptFile } from "@/lib/file-crypto";
+import { createClient } from "@supabase/supabase-js";
 
-interface SharedFile {
-  code: string;
-  name: string;
-  blob: Blob;
-  timestamp: number;
+const supabase = createClient(
+  "https://odfzxdyctwtlwrdabxrj.supabase.co",
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9kZnp4ZHljdHd0bHdyZGFieHJqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI3Mjk5MTUsImV4cCI6MjA4ODMwNTkxNX0.NtaD4V7u2rUfVAlqxY6Z8UeUrNOI8vnC9v_5Q9nKPG4"
+);
+
+function generateCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// In-memory store (client-side only, resets on refresh)
-const sharedFiles: SharedFile[] = [];
+function sanitizeFileName(name: string) {
+  return Date.now() + "_" + name.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
 
 export default function SharedFilesPage() {
   const [file, setFile] = useState<File | null>(null);
   const [password, setPassword] = useState("");
   const [processing, setProcessing] = useState(false);
   const [uploadResult, setUploadResult] = useState<{ code: string; name: string } | null>(null);
-
   const [lookupCode, setLookupCode] = useState("");
-  const [foundFile, setFoundFile] = useState<SharedFile | null>(null);
+  const [foundFile, setFoundFile] = useState<{ name: string; path: string } | null>(null);
   const [decryptPassword, setDecryptPassword] = useState("");
   const [decrypting, setDecrypting] = useState(false);
   const [decryptError, setDecryptError] = useState("");
@@ -32,10 +35,22 @@ export default function SharedFilesPage() {
     setProcessing(true);
     setError("");
     try {
-      const { encrypted, fileName } = await encryptFile(file, password);
-      const code = generateShareCode();
-      sharedFiles.push({ code, name: fileName, blob: encrypted, timestamp: Date.now() });
-      setUploadResult({ code, name: fileName });
+      const code = generateCode();
+      const safeName = sanitizeFileName(file.name);
+      const { error: uploadError } = await supabase.storage
+        .from("transfers")
+        .upload(safeName, file);
+      if (uploadError) throw uploadError;
+
+      const { error: dbError } = await supabase.from("transfers").insert({
+        code,
+        original_name: file.name,
+        storage_path: safeName,
+        expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      });
+      if (dbError) throw dbError;
+
+      setUploadResult({ code, name: file.name });
       setFile(null);
       setPassword("");
     } catch (e: unknown) {
@@ -45,21 +60,24 @@ export default function SharedFilesPage() {
     }
   };
 
-  const handleLookup = () => {
-    const found = sharedFiles.find(f => f.code === lookupCode.toUpperCase());
-    if (found) {
-      // Check 24h expiry
-      if (Date.now() - found.timestamp > 24 * 60 * 60 * 1000) {
-        setError("This share code has expired");
-        setFoundFile(null);
-      } else {
-        setFoundFile(found);
-        setError("");
-      }
-    } else {
+  const handleLookup = async () => {
+    setError("");
+    setFoundFile(null);
+    const { data, error: dbError } = await supabase
+      .from("transfers")
+      .select("*")
+      .eq("code", lookupCode.toUpperCase())
+      .single();
+
+    if (dbError || !data) {
       setError("Share code not found");
-      setFoundFile(null);
+      return;
     }
+    if (new Date(data.expires_at) < new Date()) {
+      setError("This share code has expired");
+      return;
+    }
+    setFoundFile({ name: data.original_name, path: data.storage_path });
   };
 
   const handleDecryptAndDownload = async () => {
@@ -67,7 +85,12 @@ export default function SharedFilesPage() {
     setDecrypting(true);
     setDecryptError("");
     try {
-      const fileObj = new File([foundFile.blob], foundFile.name);
+      const { data, error: dlError } = await supabase.storage
+        .from("transfers")
+        .download(foundFile.path);
+      if (dlError || !data) throw dlError;
+
+      const fileObj = new File([data], foundFile.name);
       const { decrypted, fileName } = await decryptFile(fileObj, decryptPassword);
       const url = URL.createObjectURL(decrypted);
       const a = document.createElement("a");
@@ -89,7 +112,6 @@ export default function SharedFilesPage() {
         <p className="text-muted-foreground mb-8">Share encrypted files using share codes. Files expire after 24 hours.</p>
 
         <div className="grid gap-8 md:grid-cols-2">
-          {/* Upload section */}
           <div className="space-y-4">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <Lock className="h-4 w-4 text-primary" />
@@ -108,22 +130,17 @@ export default function SharedFilesPage() {
               disabled={!file || !password || processing}
               className="w-full px-4 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium hover:bg-primary/90 transition-colors disabled:opacity-50"
             >
-              {processing ? "Encrypting..." : "Encrypt & Share"}
+              {processing ? "Uploading..." : "Encrypt & Share"}
             </button>
 
             {uploadResult && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="p-4 rounded-lg bg-card border border-border cyber-border"
-              >
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                className="p-4 rounded-lg bg-card border border-border">
                 <p className="text-sm text-muted-foreground mb-1">Share this code:</p>
                 <div className="flex items-center gap-2">
                   <span className="font-mono font-bold text-2xl text-primary tracking-[0.3em]">{uploadResult.code}</span>
-                  <button
-                    onClick={() => navigator.clipboard.writeText(uploadResult.code)}
-                    className="text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded bg-secondary"
-                  >
+                  <button onClick={() => navigator.clipboard.writeText(uploadResult.code)}
+                    className="text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded bg-secondary">
                     Copy
                   </button>
                 </div>
@@ -134,7 +151,6 @@ export default function SharedFilesPage() {
             )}
           </div>
 
-          {/* Download section */}
           <div className="space-y-4">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <Search className="h-4 w-4 text-cyber-blue" />
@@ -148,42 +164,29 @@ export default function SharedFilesPage() {
                 maxLength={6}
                 className="flex-1 rounded-lg border border-border bg-card px-4 py-3 text-sm font-mono tracking-widest uppercase focus:outline-none focus:ring-2 focus:ring-ring"
               />
-              <button
-                onClick={handleLookup}
-                disabled={lookupCode.length !== 6}
-                className="px-4 py-3 rounded-lg bg-secondary text-secondary-foreground font-medium hover:bg-secondary/80 transition-colors disabled:opacity-50"
-              >
+              <button onClick={handleLookup} disabled={lookupCode.length !== 6}
+                className="px-4 py-3 rounded-lg bg-secondary text-secondary-foreground font-medium hover:bg-secondary/80 transition-colors disabled:opacity-50">
                 Find
               </button>
             </div>
 
             {foundFile && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="p-4 rounded-lg bg-card border border-border space-y-3"
-              >
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                className="p-4 rounded-lg bg-card border border-border space-y-3">
                 <div className="flex items-center gap-2">
                   <Download className="h-4 w-4 text-primary" />
                   <span className="text-sm font-mono">{foundFile.name}</span>
                 </div>
-                <input
-                  type="password"
-                  value={decryptPassword}
+                <input type="password" value={decryptPassword}
                   onChange={(e) => setDecryptPassword(e.target.value)}
                   placeholder="Enter password to decrypt"
                   className="w-full rounded-lg border border-border bg-card px-4 py-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-ring"
                 />
-                <button
-                  onClick={handleDecryptAndDownload}
-                  disabled={!decryptPassword || decrypting}
-                  className="w-full px-4 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium hover:bg-primary/90 transition-colors disabled:opacity-50"
-                >
+                <button onClick={handleDecryptAndDownload} disabled={!decryptPassword || decrypting}
+                  className="w-full px-4 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium hover:bg-primary/90 transition-colors disabled:opacity-50">
                   {decrypting ? "Decrypting..." : "Decrypt & Download"}
                 </button>
-                {decryptError && (
-                  <p className="text-sm text-destructive">{decryptError}</p>
-                )}
+                {decryptError && <p className="text-sm text-destructive">{decryptError}</p>}
               </motion.div>
             )}
           </div>
